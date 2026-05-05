@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "shokz-monitor"
-version = "1.0.0"
+version = "1.2.0"
 description = "Event-driven Shokz headphone battery & connection monitor for Linux"
 readme = "README.md"
 license = { text = "MIT" }

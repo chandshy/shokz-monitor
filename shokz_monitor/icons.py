@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -122,28 +123,40 @@ def _render_icon(pct: Optional[int], connected: bool) -> str:
     # ── Write PNG ─────────────────────────────────────────────────────────────
     tag  = f"{pct if pct is not None else 'x'}_{1 if connected else 0}"
     path = str(_ICON_DIR / f"icon_{tag}.png")
-    surf.write_to_png(path)
+    try:
+        surf.write_to_png(path)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Failed to write icon %s: %s", path, exc)
+        # Return whatever path we have — AppIndicator will show a missing-icon placeholder.
     surf.finish()
     return path
 
 
-def get_icon(battery: Optional[int], connected: bool) -> str:
-    """Return path to a cached PNG icon for the given state."""
-    if battery is not None:
-        bucket = round(battery / 5) * 5
-        bucket = max(0, min(100, bucket))
-    else:
-        bucket = None
+_CACHE_LOCK = threading.Lock()
 
+
+def get_icon(battery: Optional[int], connected: bool) -> str:
+    """Return path to a cached PNG icon for the given state (exact % precision)."""
+    bucket = max(0, min(100, battery)) if battery is not None else None
     key = (bucket, connected)
-    if key not in _CACHE:
-        _CACHE[key] = _render_icon(bucket, connected)
-    return _CACHE[key]
+    with _CACHE_LOCK:
+        if key not in _CACHE:
+            _CACHE[key] = _render_icon(bucket, connected)
+        return _CACHE[key]
 
 
 def prewarm() -> None:
-    """Pre-render common states at startup so first update is instant."""
-    for pct in (100, 80, 60, 40, 20, 10, 5):
-        get_icon(pct, True)
-    get_icon(None, False)
-    get_icon(80, False)
+    """Pre-render all 101 battery levels in a background thread.
+
+    Returns immediately so startup is not delayed. By the time a real battery
+    update arrives the icon will already be cached.
+    """
+    def _worker() -> None:
+        for pct in range(0, 101):
+            get_icon(pct, True)
+        get_icon(None, True)
+        get_icon(None, False)
+
+    t = threading.Thread(target=_worker, daemon=True, name="shokz-icon-prewarm")
+    t.start()

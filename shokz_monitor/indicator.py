@@ -89,11 +89,17 @@ class ShokzIndicator:
     # ── State update (called from BlueZMonitor via GLib main loop) ────────────
 
     def update(self, state: DeviceState) -> None:
+        try:
+            self._apply_update(state)
+        except Exception as exc:
+            log.warning("Indicator update failed (AppIndicator proxy may have died): %s", exc)
+
+    def _apply_update(self, state: DeviceState) -> None:
         connected = state.connected
         battery   = state.battery
 
         icon  = get_icon(battery, connected)
-        label = self._make_label(battery, connected)
+        label = self._make_label(state)
 
         self._ind.set_icon_full(icon, label)
         self._ind.set_label(f"  {label}", "")
@@ -101,9 +107,18 @@ class ShokzIndicator:
         self._item_status.set_label(
             f"{self._device_name}: {'Connected' if connected else 'Disconnected'}"
         )
-        self._item_battery.set_label(
-            f"Battery: {battery}%" if battery is not None else "Battery: —"
-        )
+
+        # Primary battery line: show aggregate or "—"
+        if state.battery_left is not None or state.battery_right is not None:
+            parts = []
+            if state.battery_left  is not None: parts.append(f"L: {state.battery_left}%")
+            if state.battery_right is not None: parts.append(f"R: {state.battery_right}%")
+            if state.battery_case  is not None: parts.append(f"Case: {state.battery_case}%")
+            self._item_battery.set_label("  ".join(parts))
+        else:
+            self._item_battery.set_label(
+                f"Battery: {battery}%" if battery is not None else "Battery: —"
+            )
 
         # Connect / Disconnect sensitivity
         self._item_connect.set_sensitive(not connected)
@@ -125,7 +140,7 @@ class ShokzIndicator:
             else:
                 self._notifier.on_disconnected()
 
-        # Battery threshold notifications
+        # Battery threshold notifications (use aggregate — lower of L/R)
         if connected and battery is not None:
             self._notifier.check_battery(battery)
 
@@ -169,16 +184,18 @@ class ShokzIndicator:
         return item
 
     @staticmethod
-    def _make_label(battery: Optional[int], connected: bool) -> str:
-        if not connected:
+    def _make_label(state: DeviceState) -> str:
+        if not state.connected:
             return "—"
-        if battery is None:
-            return "?"
-        return f"{battery}%"
+        if state.battery_left is not None and state.battery_right is not None:
+            return f"L:{state.battery_left} R:{state.battery_right}"
+        if state.battery is not None:
+            return f"{state.battery}%"
+        return "?"
 
     def _notify_setup(self) -> None:
-        from gi.repository import Notify
         try:
+            from gi.repository import Notify
             n = Notify.Notification.new(
                 "Battery Reporting Unavailable",
                 "BlueZ experimental features must be enabled. "
@@ -187,5 +204,5 @@ class ShokzIndicator:
             )
             n.set_urgency(Notify.Urgency.NORMAL)
             n.show()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Could not send setup notification: %s", exc)

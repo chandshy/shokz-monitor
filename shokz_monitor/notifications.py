@@ -61,7 +61,7 @@ class Notifier:
             n.set_urgency(urgency)
             n.show()
         except Exception as exc:
-            log.debug("Notification failed: %s", exc)
+            log.warning("Notification failed: %s", exc)
 
     def shutdown(self) -> None:
         try:

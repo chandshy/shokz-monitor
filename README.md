@@ -4,19 +4,18 @@
 
 A lightweight, event-driven system tray monitor for Shokz wireless headphones on Ubuntu/GNOME. Zero polling — it wakes only when BlueZ fires a Bluetooth event. The battery percentage lives right in your panel, always visible, no clicking required.
 
-![screenshot placeholder](https://raw.githubusercontent.com/chandshy/shokz-monitor/main/docs/screenshot.png)
-
 ---
 
 ## Features
 
 - **Zero CPU between events** — pure D-Bus signal subscription, no polling loop
-- **Battery % in the panel** — always visible inline, no popover needed
+- **Battery % in the panel** — always visible inline, no popover needed; shows `L:X R:X` when per-earbud data is available
 - **Smart low-battery alerts** — notifications at 20 / 15 / 10 / 5 %, not every 1 %
 - **Auto-reconnect** — exponential backoff (10 → 120 s) when headphones go out of range
 - **Auto-discovery** — finds your Shokz device automatically; no MAC address needed
 - **BlueZ restart recovery** — re-syncs state if `systemctl restart bluetooth` is run
-- **Battery re-registration workaround** — refreshes battery 5 s after reconnect, working around a known BlueZ bug
+- **Battery re-registration workaround** — refreshes battery 5 s after reconnect, with a 10 s retry, working around a known BlueZ lazy-registration bug
+- **GATT BLE battery subscription** — subscribes to Shokz and BES Technology GATT characteristics; per-earbud L/R/Case data will appear automatically once the notification protocol is decoded
 - **Graceful degradation** — shows connection status and actionable setup guide if battery reporting isn't available
 - **Works with any BlueZ audio device** — optimised for Shokz, compatible with most Bluetooth headphones
 
@@ -103,15 +102,22 @@ Options:
 
 ## How it works
 
-shokz-monitor subscribes to three BlueZ D-Bus signals:
+shokz-monitor subscribes to BlueZ D-Bus signals — no timers, no polling threads.
 
 | Signal | Source | Trigger |
 |---|---|---|
 | `InterfacesAdded` | ObjectManager | Device or battery interface appears |
 | `InterfacesRemoved` | ObjectManager | Device goes out of range |
 | `PropertiesChanged` | Device1 / Battery1 | Connected state or battery % changes |
+| `PropertiesChanged` | GattCharacteristic1 | GATT BLE notification from headphones |
 
-Between events the process is completely idle — no timer fires, no subprocess is spawned. CPU usage is effectively zero when your headphones are connected and steady.
+On connect, two GATT characteristics are subscribed via `StartNotify`:
+- `UUID 77777777` — Shokz proprietary SPP over BLE (write + notify)
+- `UUID 0000fef1` — BES Technology channel (notify)
+
+BlueZ `Battery1` (the standard aggregate percentage) is also polled once 5 s after connect with a 10 s retry to work around BlueZ's lazy interface registration.
+
+Between events the process is completely idle. CPU usage is effectively zero when your headphones are connected and steady.
 
 ---
 
@@ -125,7 +131,14 @@ The icon shows a **progress arc** around a headphone silhouette:
 - **Red arc** — battery below 10 %
 - **Grey arc** — disconnected
 
-The panel label (`73%`) updates in real time whenever BlueZ reports a change.
+The panel label updates in real time:
+
+| Label | Meaning |
+|---|---|
+| `73%` | Aggregate battery from BlueZ `Battery1` |
+| `L:85 R:72` | Per-earbud from GATT (lower of L/R drives low-battery alerts) |
+| `?` | Connected but no battery data yet |
+| `—` | Disconnected |
 
 ---
 
