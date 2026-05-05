@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "shokz-monitor"
+version = "1.0.0"
+description = "Event-driven Shokz headphone battery & connection monitor for Linux"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["shokz", "bluetooth", "battery", "linux", "system-tray"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+    "Environment :: X11 Applications :: GTK",
+]
+
+# Runtime deps are system packages installed by install.sh;
+# we don't list them here to avoid pip trying to install system GI bindings.
+dependencies = []
+
+[project.scripts]
+shokz-monitor = "shokz_monitor.__main__:main"
+
+[project.urls]
+Homepage   = "https://github.com/chandshy/shokz-monitor"
+Issues     = "https://github.com/chandshy/shokz-monitor/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shokz_monitor*"]

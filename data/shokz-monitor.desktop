@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Shokz Monitor
+Comment=System tray battery and connection monitor for Shokz headphones
+Exec=python3 -m shokz_monitor
+Icon=audio-headset
+Categories=Utility;
+Keywords=shokz;bluetooth;battery;headphones;
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
