@@ -3,23 +3,24 @@ Shokz per-earbud battery reader via BlueZ GATT (BLE).
 
 Subscribes to PropertiesChanged on the Shokz proprietary GATT
 characteristics on each connect event.  Parses incoming notifications
-as A5 5A frames and fires battery_cb(role, pct) for "left", "right",
-"case" when battery data is decoded.
+as A5 5A frames and fires battery_cb(role, pct) for "left"/"right"
+when battery data is decoded.
 
 The device exposes two notify channels:
   service 66666666 / char 77777777  (write+notify, Shokz SPP)
   service 0000fef0 / char 0000fef1  (notify, BES Technology)
 
-The battery init sequence is not yet decoded — _parse_a55a() logs raw
-frames and returns None until filled in.  All raw notifications are
-logged at DEBUG level so a future capture session can complete the
-decoder without further infrastructure work.
+CMD 0x30 (per-earbud battery) is broadcast passively every ~2 s over
+RFCOMM ch28 (GAIA) and likely over the BLE SPP characteristic as well.
+Frame decode was derived from passive RFCOMM captures; left/right role
+assignment is tentative (confirmed primary=right in multipoint tests;
+verify with a btsnoop capture if earbuds swap unexpectedly).
 """
 from __future__ import annotations
 
 import logging
 import struct
-from typing import Callable, Optional
+from typing import Callable
 
 import dbus
 from gi.repository import GLib
@@ -36,42 +37,50 @@ _NOTIFY_REL = [
     "servicea000/chara001",  # UUID 77777777-... (Shokz SPP, write+notify)
     "service8000/char8004",  # UUID 0000fef1-... (BES Technology, notify)
 ]
-# Write channels: we send probe/init packets here after subscribing.
-_WRITE_REL = [
-    "servicea000/chara001",  # UUID 77777777-... (also writable)
-    "service8000/char8001",  # UUID 0000fef2-... (BES write channel)
-]
 
 BatteryCallback = Callable[[str, int], None]
 
 
-def _parse_a55a(data: bytes) -> Optional[tuple[int, int, int]]:
+def _parse_a55a(data: bytes) -> list[tuple[str, int]]:
     """
     Parse an A5 5A notification frame for per-earbud battery data.
-    Returns (left_pct, right_pct, case_pct) or None.
+    Returns a list of (role, pct) pairs — empty if frame is unrecognised.
 
     Frame layout (little-endian):
-      [0-1]  magic   A5 5A
-      [2]    cmd     command byte
-      [3]    sub     sub-command
-      [4-7]  flags   00 00 00 00
-      [8-9]  length  payload length (LE uint16)
+      [0-1]  magic    A5 5A
+      [2]    cmd      command byte
+      [3]    sub      sub-command
+      [4-7]  flags    (observed: 01 01 00 00)
+      [8-9]  pay_len  payload length (LE uint16)
       [10+]  payload
 
-    TODO: fill in battery CMD and payload offsets once a btsnoop
-    capture from a Pixel device decodes the protocol.
+    CMD 0x30 — per-earbud battery status (payload 44 bytes):
+      payload[0]   device_id byte (stable per physical earbud)
+      payload[1]   battery percent (0–100)
+      payload[42]  role flag: 0xFF = primary earbud, 0x00 = secondary
+
+    Left/right assignment: primary (0xFF) → "right", secondary (0x00) → "left".
+    Observed in multipoint captures: primary earbud is the one that accepted
+    the host connection first.  If earbuds swap roles unexpectedly, swap the
+    role strings below and re-verify with a btsnoop capture.
     """
     if len(data) < 10 or data[0] != 0xa5 or data[1] != 0x5a:
-        return None
+        return []
     cmd     = data[2]
     pay_len = struct.unpack_from("<H", data, 8)[0]
     if len(data) < 10 + pay_len:
-        return None
+        return []
     payload = data[10:10 + pay_len]
     log.debug("A5 5A CMD=0x%02x sub=0x%02x payload(%d)=%s",
               cmd, data[3], pay_len, payload.hex() if payload else "")
-    # TODO: return (left, right, case) once CMD is known
-    return None
+
+    if cmd == 0x30 and pay_len >= 44:
+        pct = payload[1]
+        if 0 <= pct <= 100:
+            role = "right" if payload[42] == 0xFF else "left"
+            return [(role, pct)]
+
+    return []
 
 
 class RfcommReader:
@@ -86,12 +95,12 @@ class RfcommReader:
     def __init__(self, mac: str, battery_cb: BatteryCallback) -> None:
         self._mac         = mac.upper()
         self._battery_cb  = battery_cb
-        self._device_path: Optional[str] = None
-        self._bus:          Optional[dbus.SystemBus] = None
+        self._device_path: str | None = None
+        self._bus:         dbus.SystemBus | None = None
         self._signal_match = None
         self._notifiers:    list = []
 
-    def start(self, device_path: Optional[str] = None) -> None:
+    def start(self, device_path: str | None = None) -> None:
         if device_path:
             self._device_path = device_path
         if not self._device_path:
@@ -157,10 +166,6 @@ class RfcommReader:
         data = bytes(changed["Value"])
         log.debug("GATT [%s] %s", path.split("/")[-1], data.hex())
 
-        result = _parse_a55a(data)
-        if result is not None:
-            left, right, case = result
-            log.info("GATT battery L=%d%% R=%d%% Case=%d%%", left, right, case)
-            GLib.idle_add(self._battery_cb, "left",  left)
-            GLib.idle_add(self._battery_cb, "right", right)
-            GLib.idle_add(self._battery_cb, "case",  case)
+        for role, pct in _parse_a55a(data):
+            log.info("GATT battery %s=%d%%", role, pct)
+            GLib.idle_add(self._battery_cb, role, pct)
