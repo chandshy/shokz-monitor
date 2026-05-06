@@ -119,7 +119,7 @@ class BlueZMonitor:
 
     # ── BlueZ service lifecycle ───────────────────────────────────────────────
 
-    def _on_bluez_owner(self, old_owner: str, new_owner: str) -> None:
+    def _on_bluez_owner(self, new_owner: str) -> None:
         if new_owner:
             log.info("BlueZ restarted — re-scanning")
             GLib.timeout_add_seconds(2, self._initial_scan)
