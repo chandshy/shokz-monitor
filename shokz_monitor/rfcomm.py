@@ -15,13 +15,22 @@ Both paths call battery_cb(role, pct) for "left" or "right" whenever
 a battery update is decoded.
 
 CMD 0x30 decode (payload 44 bytes):
-  payload[0]   device_id byte (stable per physical earbud)
-  payload[1]   battery percent 0-100
-  payload[42]  role flag: 0xFF = primary earbud -> "right",
-               0x00 = secondary earbud -> "left"
-Left/right assignment is tentative — primary earbud is the one that
-accepted the host BT connection first.  Swap the role strings in
-_parse_a55a() and re-verify with a btsnoop capture if needed.
+  payload[0]   device_id byte (stable per physical device)
+  payload[1]   battery percent 0-100; >100 when device is charging
+  payload[30]  connection marker: 6 = direct Shokz component; other values
+               are foreign devices forwarded from multipoint-connected hosts
+  payload[42]  device flag: 0xFF = right earbud (secondary, relayed by primary
+               via TWS mesh), 0x00 = left earbud (primary, direct BT link)
+  payload[43]  0x01 when the device is sitting in the charger
+
+Calibrated device_ids (may vary by unit/firmware):
+  0xEC  payload[30]=6  flag=0x00 → left earbud  (primary)
+  0xDC  payload[30]=6  flag=0xFF → right earbud (secondary, relayed by left)
+
+Case battery is not available on this channel — the case has no direct BT
+connection to the host.
+Multipoint note: with the earbuds paired to both PC and phone, the phone's
+BT accessories appear with payload[30]!=6 and are filtered out.
 """
 from __future__ import annotations
 
@@ -67,15 +76,21 @@ def _parse_a55a(data: bytes) -> list[tuple[str, int]]:
 
     CMD 0x30 — per-device battery status (payload 44 bytes):
       payload[0]   device_id byte (stable per physical device)
-      payload[1]   battery percent (0–100)
-      payload[42]  device flag: 0xFF = case/dock, 0x00 = earbud
+      payload[1]   battery percent (0–100; >100 when charging — ignored)
+      payload[30]  connection marker: 6 = direct Shokz component,
+                   4/15/3 = foreign device forwarded from multipoint host — ignore
+      payload[42]  role flag: 0xFF = right earbud (secondary, relayed by primary
+                   via TWS mesh); 0x00 = left earbud (primary, direct BT link)
+      payload[43]  charging flag: 0x01 = device is in charger
 
-    Observed with phone showing L=80% R=80% Case=90%:
-      device_id=0xEC, flag=0x00 → earbud at 79%  (maps to "left", tentative)
-      device_id=0xDC, flag=0xFF → case at 91%    (confirmed by user)
+    Calibrated with phone showing L=80% R=90% Case=100%:
+      device_id=0xEC, payload[30]=6, flag=0x00 → left earbud  at 79%  (confirmed)
+      device_id=0xDC, payload[30]=6, flag=0xFF → right earbud at 91%  (confirmed)
 
-    The second earbud does not appear in CMD 0x30; its battery is not
-    yet located.  Right earbud field remains TBD.
+    Case battery is not available on this channel.
+    With multipoint BT (earbuds paired to PC + phone simultaneously) the
+    phone's BT accessories also appear on ch28 with payload[30] != 6.
+    The payload[30]==6 guard filters these out.
     """
     if len(data) < 10 or data[0] != 0xa5 or data[1] != 0x5a:
         return []
@@ -89,8 +104,10 @@ def _parse_a55a(data: bytes) -> list[tuple[str, int]]:
 
     if cmd == 0x30 and pay_len >= 44:
         pct = payload[1]
-        if 0 <= pct <= 100:
-            role = "case" if payload[42] == 0xFF else "left"
+        # payload[30]==6 identifies direct Shokz components; other values are
+        # foreign devices forwarded from multipoint-connected hosts.
+        if 0 <= pct <= 100 and payload[30] == 6:
+            role = "right" if payload[42] == 0xFF else "left"
             return [(role, pct)]
 
     return []

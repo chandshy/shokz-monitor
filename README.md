@@ -2,20 +2,20 @@
 
 **The battery monitor Shokz Linux users have been waiting for.**
 
-A lightweight, event-driven system tray monitor for Shokz wireless headphones on Ubuntu/GNOME. Zero polling — it wakes only when BlueZ fires a Bluetooth event. The battery percentage lives right in your panel, always visible, no clicking required.
+A lightweight, event-driven system tray monitor for Shokz wireless headphones on Ubuntu/GNOME. Zero polling — it wakes only when BlueZ fires a Bluetooth event. Per-earbud battery lives right in your panel as `L:80 R:90`, always visible, no clicking required.
 
 ---
 
 ## Features
 
 - **Zero CPU between events** — pure D-Bus signal subscription, no polling loop
-- **Battery % in the panel** — always visible inline, no popover needed; shows `L:X R:X` when per-earbud data is available
-- **Smart low-battery alerts** — notifications at 20 / 15 / 10 / 5 %, not every 1 %
+- **Per-earbud battery in the panel** — shows `L:80 R:90` from the RFCOMM ch28 (GAIA) protocol, decoded without the Shokz phone app
+- **Smart low-battery alerts** — notifications at 20 / 15 / 10 / 5 %, driven by the lower of L/R
 - **Auto-reconnect** — exponential backoff (10 → 120 s) when headphones go out of range
 - **Auto-discovery** — finds your Shokz device automatically; no MAC address needed
 - **BlueZ restart recovery** — re-syncs state if `systemctl restart bluetooth` is run
 - **Battery re-registration workaround** — refreshes battery 5 s after reconnect, with a 10 s retry, working around a known BlueZ lazy-registration bug
-- **GATT BLE battery subscription** — subscribes to Shokz and BES Technology GATT characteristics; per-earbud L/R/Case data will appear automatically once the notification protocol is decoded
+- **Multipoint-aware** — filters out BT accessories forwarded from a paired phone so they don't pollute the earbud readings
 - **Graceful degradation** — shows connection status and actionable setup guide if battery reporting isn't available
 - **Works with any BlueZ audio device** — optimised for Shokz, compatible with most Bluetooth headphones
 
@@ -75,6 +75,12 @@ If you prefer not to edit config files, the tray menu's **"Enable Battery Report
 
 ---
 
+## Shokz app note
+
+shokz-monitor reads per-earbud battery via RFCOMM channel 28 (the GAIA channel). The Shokz Android/iOS app holds this channel exclusively when open — close it and your L/R readings will appear within a few seconds.
+
+---
+
 ## Wayland note
 
 Under Wayland, the system tray requires the
@@ -109,13 +115,24 @@ shokz-monitor subscribes to BlueZ D-Bus signals — no timers, no polling thread
 | `InterfacesAdded` | ObjectManager | Device or battery interface appears |
 | `InterfacesRemoved` | ObjectManager | Device goes out of range |
 | `PropertiesChanged` | Device1 / Battery1 | Connected state or battery % changes |
-| `PropertiesChanged` | GattCharacteristic1 | GATT BLE notification from headphones |
 
-On connect, two GATT characteristics are subscribed via `StartNotify`:
-- `UUID 77777777` — Shokz proprietary SPP over BLE (write + notify)
-- `UUID 0000fef1` — BES Technology channel (notify)
+### Per-earbud battery (RFCOMM ch28)
 
-BlueZ `Battery1` (the standard aggregate percentage) is also polled once 5 s after connect with a 10 s retry to work around BlueZ's lazy interface registration.
+On connect, shokz-monitor opens RFCOMM channel 28 (the GAIA/BES channel) in a background thread. The earbuds passively broadcast CMD `0x30` frames every ~2 s without any interrogation sequence.
+
+**Decoded CMD 0x30 fields (44-byte payload):**
+
+| Offset | Field | Notes |
+|---|---|---|
+| `[0]` | device_id | Stable per physical device |
+| `[1]` | battery % | 0–100; >100 means in charger (ignored) |
+| `[30]` | link marker | `6` = direct Shokz component; other values = phone's BT accessories (filtered) |
+| `[42]` | role | `0xFF` = right earbud (relayed via TWS mesh); `0x00` = left earbud |
+| `[43]` | charging | `0x01` = device is seated in charger |
+
+The left earbud (primary) handles the BT host connection and relays the right earbud's battery via the inter-earbud TWS link. The case battery is not available on this channel.
+
+When the Shokz earbuds are multipoint-paired (PC + phone simultaneously), the phone's BT accessories also appear on ch28 with `payload[30] != 6` — these are filtered out automatically.
 
 Between events the process is completely idle. CPU usage is effectively zero when your headphones are connected and steady.
 
@@ -135,8 +152,8 @@ The panel label updates in real time:
 
 | Label | Meaning |
 |---|---|
-| `73%` | Aggregate battery from BlueZ `Battery1` |
-| `L:85 R:72` | Per-earbud from GATT (lower of L/R drives low-battery alerts) |
+| `L:80 R:90` | Per-earbud from RFCOMM ch28 (lower of L/R drives low-battery alerts) |
+| `73%` | Aggregate battery from BlueZ `Battery1` (fallback if RFCOMM unavailable) |
 | `?` | Connected but no battery data yet |
 | `—` | Disconnected |
 
