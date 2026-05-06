@@ -65,10 +65,17 @@ def _parse_a55a(data: bytes) -> list[tuple[str, int]]:
       [8-9]  pay_len  payload length (LE uint16)
       [10+]  payload
 
-    CMD 0x30 — per-earbud battery status (payload 44 bytes):
-      payload[0]   device_id byte (stable per physical earbud)
+    CMD 0x30 — per-device battery status (payload 44 bytes):
+      payload[0]   device_id byte (stable per physical device)
       payload[1]   battery percent (0–100)
-      payload[42]  role flag: 0xFF = primary earbud, 0x00 = secondary
+      payload[42]  device flag: 0xFF = case/dock, 0x00 = earbud
+
+    Observed with phone showing L=80% R=80% Case=90%:
+      device_id=0xEC, flag=0x00 → earbud at 79%  (maps to "left", tentative)
+      device_id=0xDC, flag=0xFF → case at 91%    (confirmed by user)
+
+    The second earbud does not appear in CMD 0x30; its battery is not
+    yet located.  Right earbud field remains TBD.
     """
     if len(data) < 10 or data[0] != 0xa5 or data[1] != 0x5a:
         return []
@@ -83,7 +90,7 @@ def _parse_a55a(data: bytes) -> list[tuple[str, int]]:
     if cmd == 0x30 and pay_len >= 44:
         pct = payload[1]
         if 0 <= pct <= 100:
-            role = "right" if payload[42] == 0xFF else "left"
+            role = "case" if payload[42] == 0xFF else "left"
             return [(role, pct)]
 
     return []
@@ -216,17 +223,17 @@ class RfcommReader:
     def _rfcomm_on_data(self, _fd: int, condition: int) -> bool:
         if condition & (GLib.IO_ERR | GLib.IO_HUP):
             log.debug("RFCOMM ch28 closed by device")
-            self._stop_rfcomm()
-            return False
+            self._rfcomm_close_socket()
+            return False  # GLib removes the watch via False return
 
         try:
             chunk = self._rfcomm_sock.recv(256)
         except OSError:
-            self._stop_rfcomm()
+            self._rfcomm_close_socket()
             return False
 
         if not chunk:
-            self._stop_rfcomm()
+            self._rfcomm_close_socket()
             return False
 
         self._rfcomm_buf += chunk
@@ -252,7 +259,19 @@ class RfcommReader:
 
         return True  # keep watching
 
+    def _rfcomm_close_socket(self) -> None:
+        """Close the socket only — watch removal is handled by returning False."""
+        if self._rfcomm_sock is not None:
+            try:
+                self._rfcomm_sock.close()
+            except Exception:
+                pass
+            self._rfcomm_sock = None
+        self._rfcomm_watch = None
+        self._rfcomm_buf   = b""
+
     def _stop_rfcomm(self) -> None:
+        """External teardown — safe to call from outside the watch callback."""
         if self._rfcomm_watch is not None:
             GLib.source_remove(self._rfcomm_watch)
             self._rfcomm_watch = None
