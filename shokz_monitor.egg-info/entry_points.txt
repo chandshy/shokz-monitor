@@ -1,0 +1,2 @@
+[console_scripts]
+shokz-monitor = shokz_monitor.__main__:main
