@@ -40,6 +40,10 @@ _AUDIO_UUIDS = {
 # Seconds between successive reconnect attempts (last value repeats indefinitely).
 _RECONNECT_SCHEDULE = [10, 20, 40, 80, 120]
 
+# Seconds between connect probes for higher-priority devices discovery hasn't seen.
+# Paging an absent device can briefly stutter audio on the current one.
+_PROBE_INTERVAL = 60
+
 # Seconds after connect to do a first battery refresh (BlueZ registers Battery1 lazily).
 _BATTERY_REFRESH_DELAY  = 5
 # If the first refresh gets battery_interface_missing, retry once more after this delay.
@@ -233,6 +237,8 @@ class BlueZMonitor:
                             self._state.available = True
                             self._on_connected()
                         else:
+                            # Seen again only via a fresh RSSI (discovery result).
+                            self._state.available = False
                             self._on_disconnected()
                 if "Paired" in changed:
                     self._state.paired = bool(changed["Paired"])
@@ -485,6 +491,8 @@ class AudioDeviceManager:
         self._states: dict[str, DeviceState] = {}
         self._active_mac: Optional[str] = None
         self._manual_mac: Optional[str] = None
+        self._skip_mac: Optional[str] = None  # user disconnected it from the menu
+        self._probe_tick = 0
         self._ready = False
         for device in devices:
             self._add_monitor(device)
@@ -494,6 +502,29 @@ class AudioDeviceManager:
         if not self.scan_paused:
             self._start_discovery()
         self._apply_preference(connect=not self.auto_paused)
+        GLib.timeout_add_seconds(_PROBE_INTERVAL, self._probe)
+
+    def _probe_targets(self) -> list[AudioDevice]:
+        """Auto devices ranked above the current preferred one that discovery can't see."""
+        if self.auto_paused:
+            return []
+        targets = []
+        for device in self.devices:
+            if not device.auto or device.mac == self._skip_mac:
+                continue
+            if self.is_available(device.mac):
+                break  # preferred device reached; its own reconnect loop covers it
+            targets.append(device)
+        return targets
+
+    def _probe(self) -> bool:
+        targets = self._probe_targets()
+        if targets:
+            device = targets[self._probe_tick % len(targets)]
+            self._probe_tick += 1
+            log.debug("Probing %s", device.mac)
+            self._monitors[device.mac].connect()
+        return True  # repeat
 
     @staticmethod
     def _set_flag(name: str, on: bool) -> None:
@@ -563,6 +594,8 @@ class AudioDeviceManager:
 
     def _state_changed(self, mac: str, state: DeviceState) -> None:
         self._states[mac] = state
+        if mac == self._skip_mac and state.connected:
+            self._skip_mac = None
         if not self._ready or not any(
             device.mac == mac for device in self.devices
         ):
@@ -581,7 +614,11 @@ class AudioDeviceManager:
             for mac, state in self._states.items()
             if state.available or state.connected
         }
-        candidates = [device for device in self.devices if device.mac in seen]
+        candidates = [
+            device
+            for device in self.devices
+            if device.mac in seen and device.mac != self._skip_mac
+        ]
         manual = next(
             (device for device in candidates if device.mac == self._manual_mac), None
         )
@@ -644,6 +681,7 @@ class AudioDeviceManager:
         self._apply_preference(connect=not self.auto_paused)
 
     def connect(self) -> None:
+        self._skip_mac = None
         if self._active_mac:
             self._disconnect_others(self._active_mac)
             self._monitors[self._active_mac].connect()
@@ -652,11 +690,14 @@ class AudioDeviceManager:
         if mac not in self._monitors or not self.is_available(mac):
             return
         self._manual_mac = mac
+        self._skip_mac = None
         self._active_mac = mac
         self._apply_preference(connect=True)
 
     def disconnect(self) -> None:
         if self._active_mac:
+            self._skip_mac = self._active_mac
+            self._manual_mac = None
             self._monitors[self._active_mac].disconnect()
 
     def is_connected(self, mac: str) -> bool:

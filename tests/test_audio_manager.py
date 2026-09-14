@@ -70,6 +70,62 @@ class AudioDeviceManagerTest(unittest.TestCase):
         self.assertEqual(FakeMonitor.instances["AA:00"].disconnects, 1)
         self.assertEqual(FakeMonitor.instances["BB:00"].connects, 1)
 
+    @patch.object(AudioDeviceManager, "_start_discovery")
+    @patch("shokz_monitor.bluetooth.BlueZMonitor", FakeMonitor)
+    def test_menu_disconnect_falls_back_instead_of_reconnecting(self, _discovery):
+        FakeMonitor.instances = {}
+        devices = [
+            AudioDevice("AA:00", "Preferred", True),
+            AudioDevice("BB:00", "Other", True),
+        ]
+        manager = AudioDeviceManager(object(), devices, lambda _s, _n: None)
+        a, b = FakeMonitor.instances["AA:00"], FakeMonitor.instances["BB:00"]
+        b.on_state_change(DeviceState(available=True))
+        a.on_state_change(DeviceState(connected=True, available=True))
+        connects = a.connects
+
+        manager.disconnect()
+        a.on_state_change(DeviceState(available=True))  # still in range
+
+        self.assertEqual(a.connects, connects)
+        self.assertFalse(a.auto_reconnect)
+        self.assertTrue(b.auto_reconnect)
+        self.assertGreater(b.connects, 0)
+
+        manager.connect_device("AA:00")  # explicit reconnect clears the skip
+        self.assertTrue(a.auto_reconnect)
+
+    @patch.object(AudioDeviceManager, "_start_discovery")
+    @patch("shokz_monitor.bluetooth.BlueZMonitor", FakeMonitor)
+    def test_probe_rotates_unseen_higher_priority_devices(self, _discovery):
+        FakeMonitor.instances = {}
+        devices = [
+            AudioDevice("AA:00", "First", True),
+            AudioDevice("BB:00", "Second", True),
+            AudioDevice("CC:00", "Current", True),
+            AudioDevice("DD:00", "Lower", True),
+        ]
+        manager = AudioDeviceManager(object(), devices, lambda _s, _n: None)
+        m = FakeMonitor.instances
+        m["CC:00"].on_state_change(DeviceState(connected=True, available=True))
+        base = {mac: mon.connects for mac, mon in m.items()}
+
+        manager._probe()
+        manager._probe()
+        manager._probe()
+        probed = {mac: m[mac].connects - base[mac] for mac in m}
+        self.assertEqual(probed, {"AA:00": 2, "BB:00": 1, "CC:00": 0, "DD:00": 0})
+
+        m["AA:00"].on_state_change(DeviceState(connected=True, available=True))
+        self.assertEqual(manager._probe_targets(), [])
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}
+        ):
+            manager.set_auto_paused(True)
+            m["AA:00"].on_state_change(DeviceState())
+            self.assertEqual(manager._probe_targets(), [])
+
     @patch.object(AudioDeviceManager, "_stop_discovery")
     @patch.object(AudioDeviceManager, "_start_discovery")
     @patch("shokz_monitor.bluetooth.BlueZMonitor", FakeMonitor)

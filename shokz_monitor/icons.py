@@ -71,7 +71,7 @@ def _draw_headphone(
         ctx.fill()
 
 
-def _render_icon(pct: Optional[int], connected: bool) -> str:
+def _render_icon(pct: Optional[int], connected: bool, paused: bool = False) -> str:
     _ICON_DIR.mkdir(parents=True, exist_ok=True)
 
     sz   = _ICON_SIZE
@@ -120,8 +120,21 @@ def _render_icon(pct: Optional[int], connected: bool) -> str:
     # ── Headphone icon ────────────────────────────────────────────────────────
     _draw_headphone(ctx, cx, cy, r * 0.40, connected)
 
+    # ── Pause badge (bottom-right) ────────────────────────────────────────────
+    if paused:
+        br = sz * 0.22
+        bx = by = sz - br - 1
+        ctx.arc(bx, by, br, 0, 2 * math.pi)
+        ctx.set_source_rgba(0.95, 0.60, 0.05, 1.0)
+        ctx.fill()
+        ctx.set_source_rgba(0.09, 0.09, 0.09, 1.0)
+        bar_w, bar_h = br * 0.28, br * 1.0
+        for sign in (-1, 1):
+            ctx.rectangle(bx + sign * br * 0.30 - bar_w / 2, by - bar_h / 2, bar_w, bar_h)
+        ctx.fill()
+
     # ── Write PNG ─────────────────────────────────────────────────────────────
-    tag  = f"{pct if pct is not None else 'x'}_{1 if connected else 0}"
+    tag  = f"{pct if pct is not None else 'x'}_{1 if connected else 0}{'_p' if paused else ''}"
     path = str(_ICON_DIR / f"icon_{tag}.png")
     try:
         surf.write_to_png(path)
@@ -136,13 +149,13 @@ def _render_icon(pct: Optional[int], connected: bool) -> str:
 _CACHE_LOCK = threading.Lock()
 
 
-def get_icon(battery: Optional[int], connected: bool) -> str:
+def get_icon(battery: Optional[int], connected: bool, paused: bool = False) -> str:
     """Return path to a cached PNG icon for the given state (exact % precision)."""
     bucket = max(0, min(100, battery)) if battery is not None else None
-    key = (bucket, connected)
+    key = (bucket, connected, paused)
     with _CACHE_LOCK:
         if key not in _CACHE:
-            _CACHE[key] = _render_icon(bucket, connected)
+            _CACHE[key] = _render_icon(bucket, connected, paused)
         return _CACHE[key]
 
 

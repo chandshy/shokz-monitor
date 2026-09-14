@@ -44,11 +44,12 @@ class ShokzIndicator:
         self._notifier    = Notifier()
         self._prev_conn:  Optional[bool] = None
         self._setup_shown = False
+        self._last_state  = DeviceState()
 
         prewarm()
 
         # ── AppIndicator ──────────────────────────────────────────────────────
-        init_icon = get_icon(None, False)
+        init_icon = get_icon(None, False, monitor.scan_paused or monitor.auto_paused)
         self._ind  = AppIndicator.Indicator.new(
             APP_ID, init_icon, AppIndicator.IndicatorCategory.HARDWARE
         )
@@ -78,14 +79,14 @@ class ShokzIndicator:
         item_pause = Gtk.CheckMenuItem(label="Pause Scanning")
         item_pause.set_active(monitor.scan_paused)
         item_pause.connect(
-            "toggled", lambda w: self._monitor.set_scan_paused(w.get_active())
+            "toggled", lambda w: self._toggle(self._monitor.set_scan_paused, w)
         )
         self._menu.append(item_pause)
 
         item_auto = Gtk.CheckMenuItem(label="Pause Auto-Connect")
         item_auto.set_active(monitor.auto_paused)
         item_auto.connect(
-            "toggled", lambda w: self._monitor.set_auto_paused(w.get_active())
+            "toggled", lambda w: self._toggle(self._monitor.set_auto_paused, w)
         )
         self._menu.append(item_auto)
 
@@ -116,11 +117,17 @@ class ShokzIndicator:
         except Exception as exc:
             log.warning("Indicator update failed (AppIndicator proxy may have died): %s", exc)
 
+    def _toggle(self, setter, widget: Gtk.CheckMenuItem) -> None:
+        setter(widget.get_active())
+        self.update(self._last_state)
+
     def _apply_update(self, state: DeviceState) -> None:
+        self._last_state = state
         connected = state.connected
         battery   = state.battery
+        paused    = self._monitor.scan_paused or self._monitor.auto_paused
 
-        icon  = get_icon(battery, connected)
+        icon  = get_icon(battery, connected, paused)
         label = self._make_label(state)
 
         self._ind.set_icon_full(icon, label)
