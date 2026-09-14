@@ -14,6 +14,12 @@ import dbus
 from gi.repository import GLib
 
 from shokz_monitor.rfcomm import RfcommReader
+from shokz_monitor.devices import (
+    AudioDevice,
+    preferred_device,
+    save_devices,
+    scan_paused_path,
+)
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +29,13 @@ _DBUS_PROPS  = "org.freedesktop.DBus.Properties"
 _IFACE_DEV   = "org.bluez.Device1"
 _IFACE_BAT   = "org.bluez.Battery1"
 _IFACE_ADAPT = "org.bluez.Adapter1"
+
+_AUDIO_UUIDS = {
+    "00001108",  # Headset
+    "0000110b",  # A2DP Audio Sink
+    "0000111e",  # Hands-Free
+    "0000184e",  # LE Audio Stream Control
+}
 
 # Seconds between successive reconnect attempts (last value repeats indefinitely).
 _RECONNECT_SCHEDULE = [10, 20, 40, 80, 120]
@@ -37,6 +50,7 @@ _BATTERY_REFRESH_RETRY  = 10
 class DeviceState:
     connected: bool = False
     paired:    bool = False
+    available: bool = False
     battery:   Optional[int] = None   # aggregate: min(L, R) or BlueZ Battery1 fallback
     battery_left:  Optional[int] = None
     battery_right: Optional[int] = None
@@ -159,12 +173,17 @@ class BlueZMonitor:
                 p = ifaces[_IFACE_DEV]
                 new_conn   = bool(p.get("Connected", False))
                 new_paired = bool(p.get("Paired", False))
+                new_available = new_conn or "RSSI" in p
                 new_name   = str(p.get("Name", self._state.name))
-                if (new_conn, new_paired, new_name) != (
-                    self._state.connected, self._state.paired, self._state.name
+                if (new_conn, new_paired, new_available, new_name) != (
+                    self._state.connected,
+                    self._state.paired,
+                    self._state.available,
+                    self._state.name,
                 ):
                     self._state.connected = new_conn
                     self._state.paired    = new_paired
+                    self._state.available = new_available
                     self._state.name      = new_name
                     changed = True
 
@@ -185,11 +204,18 @@ class BlueZMonitor:
 
         if changed:
             self._on_change(self._state)
+        if (
+            _IFACE_DEV in ifaces
+            and self._auto_reconnect
+            and self._state.paired
+            and not self._state.connected
+        ):
+            self._schedule_reconnect()
 
     # ── Property-change signals ───────────────────────────────────────────────
 
     def _on_props_changed(
-        self, interface: str, changed: dict, _invalidated: list, path: str = ""
+        self, interface: str, changed: dict, invalidated: list, path: str = ""
     ) -> None:
         if not str(path).endswith(f"dev_{self._mac_path}"):
             return
@@ -204,6 +230,7 @@ class BlueZMonitor:
                         self._state.connected = new_conn
                         updated = True
                         if new_conn:
+                            self._state.available = True
                             self._on_connected()
                         else:
                             self._on_disconnected()
@@ -211,6 +238,16 @@ class BlueZMonitor:
                     self._state.paired = bool(changed["Paired"])
                 if "Name" in changed:
                     self._state.name = str(changed["Name"])
+                    updated = True
+                if "RSSI" in changed and not self._state.available:
+                    self._state.available = True
+                    updated = True
+                if (
+                    "RSSI" in invalidated
+                    and self._state.available
+                    and not self._state.connected
+                ):
+                    self._state.available = False
                     updated = True
 
             elif interface == _IFACE_BAT:
@@ -398,6 +435,12 @@ class BlueZMonitor:
         except dbus.DBusException:
             pass
 
+    def set_auto_reconnect(self, enabled: bool) -> None:
+        self._auto_reconnect = enabled
+        if not enabled and self._reconnect_timer is not None:
+            GLib.source_remove(self._reconnect_timer)
+            self._reconnect_timer = None
+
     @property
     def device_path(self) -> Optional[str]:
         return self._device_path
@@ -407,26 +450,208 @@ class BlueZMonitor:
         return self._mac_display
 
 
-def discover_shokz(bus: dbus.SystemBus) -> list[tuple[str, str]]:
-    """
-    Scan BlueZ for paired Shokz devices.
-    Returns list of (mac, name) tuples.
-    """
-    from shokz_monitor import SHOKZ_NAMES
+def discover_audio_devices(bus: dbus.SystemBus) -> list[tuple[str, str]]:
+    """Return paired Bluetooth devices advertising an audio profile."""
     results: list[tuple[str, str]] = []
     try:
         om = dbus.Interface(bus.get_object(_BLUEZ, "/"), _DBUS_OM)
-        for path, ifaces in om.GetManagedObjects().items():
+        for ifaces in om.GetManagedObjects().values():
             if _IFACE_DEV not in ifaces:
                 continue
             props = ifaces[_IFACE_DEV]
-            name  = str(props.get("Name", ""))
-            addr  = str(props.get("Address", ""))
-            paired = bool(props.get("Paired", False))
-            if not paired or not addr:
-                continue
-            if any(kw in name.lower() for kw in SHOKZ_NAMES):
-                results.append((addr, name))
+            uuids = {str(uuid).lower()[:8] for uuid in props.get("UUIDs", [])}
+            address = str(props.get("Address", "")).upper()
+            if bool(props.get("Paired")) and address and uuids & _AUDIO_UUIDS:
+                name = str(props.get("Alias") or props.get("Name") or address)
+                results.append((address, name))
     except dbus.DBusException as exc:
-        log.error("BlueZ scan failed: %s", exc)
+        log.error("BlueZ audio-device scan failed: %s", exc)
     return results
+
+
+class AudioDeviceManager:
+    """Keeps the first enabled device connected and other audio devices disconnected."""
+
+    def __init__(
+        self,
+        bus: dbus.SystemBus,
+        devices: list[AudioDevice],
+        on_state_change: Callable[[DeviceState, str], None],
+    ) -> None:
+        self._bus = bus
+        self.devices = devices
+        self._on_change = on_state_change
+        self._monitors: dict[str, BlueZMonitor] = {}
+        self._states: dict[str, DeviceState] = {}
+        self._active_mac: Optional[str] = None
+        self._manual_mac: Optional[str] = None
+        self._ready = False
+        for device in devices:
+            self._add_monitor(device)
+        self._ready = True
+        self.scan_paused = scan_paused_path().exists()
+        if not self.scan_paused:
+            self._start_discovery()
+        self._apply_preference(connect=True)
+
+    def set_scan_paused(self, paused: bool) -> None:
+        if paused == self.scan_paused:
+            return
+        self.scan_paused = paused
+        flag = scan_paused_path()
+        if paused:
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.touch()
+            self._stop_discovery()
+        else:
+            flag.unlink(missing_ok=True)
+            self._start_discovery()
+
+    def _adapters(self) -> list[dbus.Interface]:
+        om = dbus.Interface(self._bus.get_object(_BLUEZ, "/"), _DBUS_OM)
+        return [
+            dbus.Interface(self._bus.get_object(_BLUEZ, path), _IFACE_ADAPT)
+            for path, ifaces in om.GetManagedObjects().items()
+            if _IFACE_ADAPT in ifaces
+        ]
+
+    def _start_discovery(self) -> None:
+        try:
+            for adapter in self._adapters():
+                adapter.SetDiscoveryFilter({"Transport": "auto"})
+                adapter.StartDiscovery()
+        except dbus.DBusException as exc:
+            if "InProgress" not in str(exc):
+                log.warning("Could not start Bluetooth discovery: %s", exc)
+
+    def _stop_discovery(self) -> None:
+        try:
+            for adapter in self._adapters():
+                try:
+                    adapter.StopDiscovery()
+                except dbus.DBusException as exc:
+                    log.debug("StopDiscovery: %s", exc)  # not discovering / not ours
+        except dbus.DBusException as exc:
+            log.warning("Could not stop Bluetooth discovery: %s", exc)
+
+    def _add_monitor(self, device: AudioDevice) -> None:
+        if device.mac in self._monitors:
+            return
+        ready = self._ready
+        self._ready = False
+        self._monitors[device.mac] = BlueZMonitor(
+            device.mac,
+            lambda state, mac=device.mac: self._state_changed(mac, state),
+            auto_reconnect=False,
+        )
+        self._ready = ready
+
+    def _state_changed(self, mac: str, state: DeviceState) -> None:
+        self._states[mac] = state
+        if not self._ready or not any(
+            device.mac == mac for device in self.devices
+        ):
+            return
+
+        self._apply_preference(connect=True)
+
+    def _disconnect_others(self, keep_mac: str) -> None:
+        for mac, state in self._states.items():
+            if mac != keep_mac and state.connected and mac in self._monitors:
+                self._monitors[mac].disconnect()
+
+    def _apply_preference(self, connect: bool) -> None:
+        seen = {
+            mac
+            for mac, state in self._states.items()
+            if state.available or state.connected
+        }
+        candidates = [device for device in self.devices if device.mac in seen]
+        manual = next(
+            (device for device in candidates if device.mac == self._manual_mac), None
+        )
+        if self._manual_mac and not manual:
+            self._manual_mac = None
+        preferred = manual or preferred_device(candidates)
+        for mac, monitor in self._monitors.items():
+            monitor.set_auto_reconnect(bool(preferred and mac == preferred.mac))
+
+        available = {device.mac for device in self.devices}
+        if preferred:
+            self._active_mac = preferred.mac
+        elif self._active_mac not in available or preferred_device(self.devices):
+            connected = next(
+                (
+                    mac
+                    for mac, state in self._states.items()
+                    if state.connected and mac in available
+                ),
+                None,
+            )
+            fallback = preferred_device(self.devices)
+            self._active_mac = connected or (
+                fallback.mac
+                if fallback
+                else self.devices[0].mac if self.devices else None
+            )
+
+        if self._active_mac:
+            state = self._states.get(self._active_mac, DeviceState())
+            self._on_change(state, self.device_name)
+        if preferred:
+            self._disconnect_others(preferred.mac)
+            if connect:
+                self._monitors[preferred.mac].connect()
+
+    def refresh(self) -> list[AudioDevice]:
+        found = dict(discover_audio_devices(self._bus))
+        if not found:
+            return self.devices
+        devices = [
+            AudioDevice(device.mac, found.pop(device.mac, device.name), device.auto)
+            for device in self.devices
+            if device.mac in found
+        ]
+        devices.extend(AudioDevice(mac, name) for mac, name in sorted(found.items()))
+        self.devices = devices
+        for device in devices:
+            self._add_monitor(device)
+        self._apply_preference(connect=False)
+        return devices
+
+    def configure(self, devices: list[AudioDevice]) -> None:
+        self.devices = devices
+        save_devices(devices)
+        for device in devices:
+            self._add_monitor(device)
+        self._apply_preference(connect=True)
+
+    def connect(self) -> None:
+        if self._active_mac:
+            self._disconnect_others(self._active_mac)
+            self._monitors[self._active_mac].connect()
+
+    def connect_device(self, mac: str) -> None:
+        if mac not in self._monitors or not self.is_available(mac):
+            return
+        self._manual_mac = mac
+        self._active_mac = mac
+        self._apply_preference(connect=True)
+
+    def disconnect(self) -> None:
+        if self._active_mac:
+            self._monitors[self._active_mac].disconnect()
+
+    def is_connected(self, mac: str) -> bool:
+        return self._states.get(mac, DeviceState()).connected
+
+    def is_available(self, mac: str) -> bool:
+        state = self._states.get(mac, DeviceState())
+        return state.available or state.connected
+
+    @property
+    def device_name(self) -> str:
+        return next(
+            (device.name for device in self.devices if device.mac == self._active_mac),
+            "Bluetooth Audio",
+        )

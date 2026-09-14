@@ -1,0 +1,12 @@
+[Unit]
+Description=Shokz Monitor tray indicator
+PartOf=graphical-session.target
+After=graphical-session.target bluetooth.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m shokz_monitor
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

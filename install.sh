@@ -21,15 +21,15 @@ fi
 echo "==> Installing package…"
 pip3 install --user -e "$REPO_DIR"
 
-echo "==> Installing autostart entry…"
-mkdir -p "$HOME/.config/autostart"
-cp "$REPO_DIR/data/shokz-monitor.desktop" "$HOME/.config/autostart/"
+echo "==> Installing systemd user service…"
+rm -f "$HOME/.config/autostart/shokz-monitor.desktop"
+mkdir -p "$HOME/.config/systemd/user"
+cp "$REPO_DIR/data/shokz-monitor.service" "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now shokz-monitor.service
 
 echo
-echo "Done. To start now, run:"
-echo "  python3 -m shokz_monitor"
-echo
-echo "It will auto-start on next login."
+echo "Done. Starts with the graphical session and restarts if it exits."
 echo
 echo "If battery level doesn't appear, enable BlueZ experimental features:"
 echo "  sudo sed -i '/^\[Policy\]/a Experimental = true' /etc/bluetooth/main.conf"

@@ -20,7 +20,9 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib
 
 from shokz_monitor import __version__, DBUS_NAME
-from shokz_monitor.bluetooth import BlueZMonitor, discover_shokz
+from shokz_monitor import SHOKZ_NAMES
+from shokz_monitor.bluetooth import AudioDeviceManager, discover_audio_devices
+from shokz_monitor.devices import AudioDevice, config_path, load_devices
 
 
 def _parse_args() -> argparse.Namespace:
@@ -92,45 +94,56 @@ def main() -> None:
 
     _single_instance(session_bus)
 
-    # ── Resolve device MAC ────────────────────────────────────────────────────
-    mac  = args.mac
-    name = args.name
+    # ── Resolve paired audio devices and saved priority ──────────────────────
+    found = discover_audio_devices(system_bus)
+    had_config = config_path().exists()
+    devices = load_devices(found)
 
-    if not mac:
-        found = discover_shokz(system_bus)
-        if not found:
-            sys.exit(
-                "No paired Shokz device found.\n"
-                "Pair your headphones in GNOME Bluetooth Settings first,\n"
-                "or specify --mac AA:BB:CC:DD:EE:FF manually."
-            )
-        if len(found) > 1:
-            print("Multiple Shokz devices found — specify --mac:\n")
-            for addr, n in found:
-                print(f"  {addr}  {n}")
-            sys.exit(1)
-        mac, discovered_name = found[0]
-        name = name or discovered_name
-        print(f"Auto-detected: {name}  ({mac})")
+    if args.mac:
+        mac = args.mac.upper()
+        selected = next((device for device in devices if device.mac == mac), None)
+        if selected is None:
+            selected = AudioDevice(mac, args.name or "Bluetooth Audio")
+        elif args.name:
+            selected.name = args.name
+        selected.auto = args.auto_reconnect
+        devices = [selected] + [device for device in devices if device.mac != mac]
+        for device in devices[1:]:
+            device.auto = False
+    elif not had_config and devices:
+        shokz = next(
+            (
+                device
+                for device in devices
+                if any(name in device.name.lower() for name in SHOKZ_NAMES)
+            ),
+            devices[0],
+        )
+        devices.remove(shokz)
+        devices.insert(0, shokz)
+        shokz.auto = args.auto_reconnect
+    elif not args.auto_reconnect:
+        for device in devices:
+            device.auto = False
 
-    name = name or "Shokz"
+    if not devices:
+        sys.exit(
+            "No paired Bluetooth audio device found.\n"
+            "Pair one in Bluetooth Settings first, or specify --mac manually."
+        )
 
     # ── Wire up monitor → indicator ───────────────────────────────────────────
     from shokz_monitor.indicator import ShokzIndicator
 
     indicator: list[ShokzIndicator] = []  # deferred so GTK init happens first
 
-    def on_state(state) -> None:
+    def on_state(state, name) -> None:
         if indicator:
-            GLib.idle_add(indicator[0].update, state)
+            GLib.idle_add(indicator[0].update, state, name)
 
-    monitor = BlueZMonitor(
-        mac=mac,
-        on_state_change=on_state,
-        auto_reconnect=args.auto_reconnect,
-    )
+    monitor = AudioDeviceManager(system_bus, devices, on_state)
 
-    ind = ShokzIndicator(monitor, name)
+    ind = ShokzIndicator(monitor, monitor.device_name)
     indicator.append(ind)
 
     try:

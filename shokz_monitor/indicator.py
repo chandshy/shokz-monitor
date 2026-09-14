@@ -20,7 +20,8 @@ gi.require_version("Notify",               "0.7")
 from gi.repository import Gtk, GLib, AyatanaAppIndicator3 as AppIndicator
 
 from shokz_monitor import APP_ID
-from shokz_monitor.bluetooth import BlueZMonitor, DeviceState
+from shokz_monitor.bluetooth import AudioDeviceManager, DeviceState
+from shokz_monitor.devices import AudioDevice
 from shokz_monitor.icons import get_icon, prewarm
 from shokz_monitor.notifications import Notifier
 
@@ -37,7 +38,7 @@ _SETUP_CMD  = (
 
 
 class ShokzIndicator:
-    def __init__(self, monitor: BlueZMonitor, device_name: str) -> None:
+    def __init__(self, monitor: AudioDeviceManager, device_name: str) -> None:
         self._monitor     = monitor
         self._device_name = device_name
         self._notifier    = Notifier()
@@ -70,6 +71,17 @@ class ShokzIndicator:
         self._menu.append(item_connect)
         self._menu.append(item_disconnect)
 
+        item_devices = Gtk.MenuItem(label="Audio Devices…")
+        item_devices.connect("activate", self._on_devices)
+        self._menu.append(item_devices)
+
+        item_pause = Gtk.CheckMenuItem(label="Pause Scanning")
+        item_pause.set_active(monitor.scan_paused)
+        item_pause.connect(
+            "toggled", lambda w: self._monitor.set_scan_paused(w.get_active())
+        )
+        self._menu.append(item_pause)
+
         self._menu.append(Gtk.SeparatorMenuItem())
 
         self._item_setup = Gtk.MenuItem(
@@ -88,8 +100,11 @@ class ShokzIndicator:
 
     # ── State update (called from BlueZMonitor via GLib main loop) ────────────
 
-    def update(self, state: DeviceState) -> None:
+    def update(self, state: DeviceState, device_name: Optional[str] = None) -> None:
         try:
+            if device_name:
+                self._device_name = device_name
+                self._ind.set_title(device_name)
             self._apply_update(state)
         except Exception as exc:
             log.warning("Indicator update failed (AppIndicator proxy may have died): %s", exc)
@@ -153,6 +168,115 @@ class ShokzIndicator:
 
     def _on_disconnect(self, _widget: Gtk.MenuItem) -> None:
         self._monitor.disconnect()
+
+    def _on_devices(self, _widget: Gtk.MenuItem) -> None:
+        dialog = Gtk.Dialog(
+            title="Audio Devices",
+            transient_for=None,
+            flags=0,
+            buttons=(
+                "Cancel",
+                Gtk.ResponseType.CANCEL,
+                "Apply",
+                Gtk.ResponseType.APPLY,
+            ),
+        )
+        dialog.set_default_size(620, 340)
+        box = dialog.get_content_area()
+        note = Gtk.Label(
+            label=(
+                "The highest checked Auto device currently available is kept "
+                "connected; other audio devices are disconnected."
+            )
+        )
+        note.set_line_wrap(True)
+        note.set_xalign(0)
+        box.pack_start(note, False, False, 8)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        for text, width in (
+            ("Auto", 40),
+            ("Device", 180),
+            ("Address", 140),
+            ("Status", 100),
+        ):
+            label = Gtk.Label(label=text, xalign=0)
+            label.set_size_request(width, -1)
+            header.pack_start(label, False, False, 0)
+        box.pack_start(header, False, False, 4)
+
+        device_list = Gtk.ListBox()
+        device_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        rows = {}
+        connect_buttons = []
+        for device in self._monitor.refresh():
+            status = (
+                "Connected"
+                if self._monitor.is_connected(device.mac)
+                else "Disconnected"
+            )
+            row = Gtk.ListBoxRow()
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            auto = Gtk.CheckButton()
+            auto.set_active(device.auto)
+            auto.set_size_request(40, -1)
+            line.pack_start(auto, False, False, 0)
+            for text, width in ((device.name, 180), (device.mac, 140), (status, 100)):
+                label = Gtk.Label(label=text, xalign=0)
+                label.set_size_request(width, -1)
+                line.pack_start(label, False, False, 0)
+            connect = Gtk.Button(label="Connect")
+            connect.set_sensitive(not self._monitor.is_connected(device.mac))
+            connect.set_no_show_all(True)
+            connect.connect(
+                "clicked",
+                lambda _button, mac=device.mac: self._monitor.connect_device(mac),
+            )
+            line.pack_start(connect, False, False, 0)
+            row.add(line)
+            device_list.add(row)
+            rows[row] = (auto, device)
+            if self._monitor.is_available(device.mac):
+                connect_buttons.append(connect)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(device_list)
+        box.pack_start(scroll, True, True, 0)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        up = Gtk.Button(label="Move Up")
+        down = Gtk.Button(label="Move Down")
+        buttons.pack_start(up, False, False, 0)
+        buttons.pack_start(down, False, False, 0)
+        box.pack_start(buttons, False, False, 8)
+
+        def move(offset: int) -> None:
+            row = device_list.get_selected_row()
+            if row is None:
+                return
+            index = row.get_index()
+            target = index + offset
+            if 0 <= target < len(rows):
+                device_list.remove(row)
+                device_list.insert(row, target)
+                device_list.select_row(row)
+
+        up.connect("clicked", lambda _button: move(-1))
+        down.connect("clicked", lambda _button: move(1))
+        dialog.show_all()
+        for button in connect_buttons:
+            button.show_all()
+        response = dialog.run()
+        if response == Gtk.ResponseType.APPLY:
+            self._monitor.configure(
+                [
+                    AudioDevice(device.mac, device.name, auto.get_active())
+                    for row in device_list.get_children()
+                    for auto, device in (rows[row],)
+                ]
+            )
+        dialog.destroy()
 
     def _on_setup_guide(self, _widget: Gtk.MenuItem) -> None:
         dialog = Gtk.MessageDialog(
