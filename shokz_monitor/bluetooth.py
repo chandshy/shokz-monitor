@@ -18,7 +18,7 @@ from shokz_monitor.devices import (
     AudioDevice,
     preferred_device,
     save_devices,
-    scan_paused_path,
+    flag_path,
 )
 
 log = logging.getLogger(__name__)
@@ -380,7 +380,7 @@ class BlueZMonitor:
     # ── Auto-reconnect ────────────────────────────────────────────────────────
 
     def _schedule_reconnect(self) -> None:
-        if self._reconnect_timer is not None:
+        if self._reconnect_timer is not None or not self._auto_reconnect:
             return
         delay = _RECONNECT_SCHEDULE[
             min(self._reconnect_attempt, len(_RECONNECT_SCHEDULE) - 1)
@@ -489,23 +489,38 @@ class AudioDeviceManager:
         for device in devices:
             self._add_monitor(device)
         self._ready = True
-        self.scan_paused = scan_paused_path().exists()
+        self.scan_paused = flag_path("scan-paused").exists()
+        self.auto_paused = flag_path("autoconnect-paused").exists()
         if not self.scan_paused:
             self._start_discovery()
-        self._apply_preference(connect=True)
+        self._apply_preference(connect=not self.auto_paused)
+
+    @staticmethod
+    def _set_flag(name: str, on: bool) -> None:
+        flag = flag_path(name)
+        if on:
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.touch()
+        else:
+            flag.unlink(missing_ok=True)
 
     def set_scan_paused(self, paused: bool) -> None:
         if paused == self.scan_paused:
             return
         self.scan_paused = paused
-        flag = scan_paused_path()
+        self._set_flag("scan-paused", paused)
         if paused:
-            flag.parent.mkdir(parents=True, exist_ok=True)
-            flag.touch()
             self._stop_discovery()
         else:
-            flag.unlink(missing_ok=True)
             self._start_discovery()
+
+    def set_auto_paused(self, paused: bool) -> None:
+        if paused == self.auto_paused:
+            return
+        self.auto_paused = paused
+        self._set_flag("autoconnect-paused", paused)
+        self._manual_mac = None
+        self._apply_preference(connect=not paused)
 
     def _adapters(self) -> list[dbus.Interface]:
         om = dbus.Interface(self._bus.get_object(_BLUEZ, "/"), _DBUS_OM)
@@ -553,7 +568,7 @@ class AudioDeviceManager:
         ):
             return
 
-        self._apply_preference(connect=True)
+        self._apply_preference(connect=not self.auto_paused)
 
     def _disconnect_others(self, keep_mac: str) -> None:
         for mac, state in self._states.items():
@@ -572,9 +587,11 @@ class AudioDeviceManager:
         )
         if self._manual_mac and not manual:
             self._manual_mac = None
-        preferred = manual or preferred_device(candidates)
+        preferred = manual or (None if self.auto_paused else preferred_device(candidates))
         for mac, monitor in self._monitors.items():
-            monitor.set_auto_reconnect(bool(preferred and mac == preferred.mac))
+            monitor.set_auto_reconnect(
+                bool(preferred and mac == preferred.mac and not self.auto_paused)
+            )
 
         available = {device.mac for device in self.devices}
         if preferred:
@@ -598,7 +615,7 @@ class AudioDeviceManager:
         if self._active_mac:
             state = self._states.get(self._active_mac, DeviceState())
             self._on_change(state, self.device_name)
-        if preferred:
+        if preferred and (connect or not self.auto_paused):
             self._disconnect_others(preferred.mac)
             if connect:
                 self._monitors[preferred.mac].connect()
@@ -624,7 +641,7 @@ class AudioDeviceManager:
         save_devices(devices)
         for device in devices:
             self._add_monitor(device)
-        self._apply_preference(connect=True)
+        self._apply_preference(connect=not self.auto_paused)
 
     def connect(self) -> None:
         if self._active_mac:

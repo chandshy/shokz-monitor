@@ -18,8 +18,8 @@ def config_path() -> Path:
     return root / "shokz-monitor" / "devices.json"
 
 
-def scan_paused_path() -> Path:
-    return config_path().with_name("scan-paused")
+def flag_path(name: str) -> Path:
+    return config_path().with_name(name)
 
 
 def load_devices(

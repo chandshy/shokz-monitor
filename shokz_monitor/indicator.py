@@ -82,6 +82,13 @@ class ShokzIndicator:
         )
         self._menu.append(item_pause)
 
+        item_auto = Gtk.CheckMenuItem(label="Pause Auto-Connect")
+        item_auto.set_active(monitor.auto_paused)
+        item_auto.connect(
+            "toggled", lambda w: self._monitor.set_auto_paused(w.get_active())
+        )
+        self._menu.append(item_auto)
+
         self._menu.append(Gtk.SeparatorMenuItem())
 
         self._item_setup = Gtk.MenuItem(

@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from shokz_monitor.bluetooth import AudioDeviceManager, DeviceState
-from shokz_monitor.devices import AudioDevice
+from shokz_monitor.devices import AudioDevice, flag_path
 
 
 class FakeMonitor:
@@ -90,6 +90,35 @@ class AudioDeviceManagerTest(unittest.TestCase):
 
             restarted.set_scan_paused(False)
             self.assertEqual(start.call_count, 2)
+
+    @patch.object(AudioDeviceManager, "_start_discovery")
+    @patch("shokz_monitor.bluetooth.BlueZMonitor", FakeMonitor)
+    def test_auto_connect_pause(self, _discovery):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"XDG_CONFIG_HOME": tmp}
+        ):
+            FakeMonitor.instances = {}
+            devices = [
+                AudioDevice("AA:00", "Preferred", True),
+                AudioDevice("BB:00", "Other"),
+            ]
+            manager = AudioDeviceManager(object(), devices, lambda _s, _n: None)
+            a, b = FakeMonitor.instances["AA:00"], FakeMonitor.instances["BB:00"]
+            manager.set_auto_paused(True)
+
+            a.on_state_change(DeviceState(available=True))
+            b.on_state_change(DeviceState(connected=True, available=True))
+            self.assertFalse(a.auto_reconnect)
+            self.assertEqual((a.connects, b.disconnects), (0, 0))
+
+            manager.connect_device("AA:00")  # manual still works
+            self.assertEqual((a.connects, b.disconnects), (1, 1))
+            self.assertFalse(a.auto_reconnect)
+
+            manager.set_auto_paused(False)
+            self.assertTrue(a.auto_reconnect)
+            self.assertEqual(a.connects, 2)
+            self.assertFalse(flag_path("autoconnect-paused").exists())
 
 
 if __name__ == "__main__":
